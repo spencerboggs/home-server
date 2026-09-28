@@ -1,0 +1,72 @@
+{
+	email {$ACME_EMAIL}
+}
+
+(common) {
+##TLS##
+	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+{$DASHBOARD_HOST} {
+	import common
+	handle /health {
+		reverse_proxy server-dashboard:8000
+	}
+	handle {
+		reverse_proxy server-dashboard:8000
+	}
+}
+
+{$AUTH_HOST} {
+	import common
+	reverse_proxy server-authentik:9000
+}
+
+{$GRAFANA_HOST} {
+	import common
+	reverse_proxy server-grafana:3000
+}
+
+{$NOTIFY_HOST} {
+	import common
+	reverse_proxy server-ntfy:80
+}
+
+##MEDIA##
+{$MEDIA_HOST} {
+	import common
+	reverse_proxy server-jellyfin:8096
+}
+##/MEDIA##
+
+##GIT##
+{$GIT_HOST} {
+	import common
+	reverse_proxy server-forgejo:3000
+}
+##/GIT##
+
+##COLLAB##
+{$FILES_HOST} {
+	import common
+	reverse_proxy server-nextcloud:80
+}
+
+{$OFFICE_HOST} {
+	import common
+	reverse_proxy server-collabora:9980
+}
+##/COLLAB##
+
+##DEPLOY##
+{$APPS_HOST} {
+	import common
+	reverse_proxy server-coolify:8080
+}
+##/DEPLOY##

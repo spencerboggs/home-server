@@ -1,0 +1,7 @@
+[
+  {
+    "name": "Public entry",
+    "url": "https://example.github.io/the-server/",
+    "description": "GitHub Pages status page. It only checks /health."
+  }
+]

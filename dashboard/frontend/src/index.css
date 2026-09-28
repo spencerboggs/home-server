@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background:
+    radial-gradient(1200px 500px at 10% -10%, rgba(226, 172, 74, 0.14), transparent 50%),
+    #14120e;
+  color: #f4ecdc;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #3c362b;
+  border-radius: 99px;
+}
+
+.field {
+  @apply w-full rounded-xl border border-line bg-black/30 px-3 py-2 outline-none;
+}
+
+.btn {
+  @apply rounded-full bg-brass px-4 py-2 font-medium text-ink disabled:opacity-50;
+}

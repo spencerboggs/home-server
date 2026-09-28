@@ -1,0 +1,581 @@
+# Images are pulled on the server. Nothing in this file is vendored into git.
+# Only Caddy publishes 80/443. Only the games profile publishes 25565.
+# Other services stay on the Docker networks.
+
+name: the-server
+
+networks:
+  edge:
+  private:
+
+volumes:
+  coolify-db:
+  coolify-redis:
+
+services:
+  caddy:
+    container_name: server-caddy
+    profiles: ["core"]
+    build: ./infrastructure/caddy
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./runtime/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /srv/server/data/caddy:/data
+    networks: [edge]
+    depends_on:
+      - dashboard
+      - authentik
+
+  authentik-db:
+    container_name: server-authentik-db
+    profiles: ["core"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${PG_PASS:?database password required}
+    volumes:
+      - /srv/server/data/authentik/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [private]
+
+  authentik:
+    container_name: server-authentik
+    profiles: ["core"]
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG:-2026.8.3}
+    restart: unless-stopped
+    command: server
+    env_file: .env
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?secret key required}
+      DASHBOARD_URL: https://${DASHBOARD_HOST}
+      DASHBOARD_REDIRECT_URI: https://${DASHBOARD_HOST}/api/auth/callback
+      GRAFANA_URL: https://${GRAFANA_HOST}
+      GRAFANA_REDIRECT_URI: https://${GRAFANA_HOST}/login/generic_oauth
+      FORGEJO_URL: https://${GIT_HOST}
+      FORGEJO_REDIRECT_URI: https://${GIT_HOST}/user/oauth2/authentik/callback
+      NEXTCLOUD_URL: https://${FILES_HOST}
+      NEXTCLOUD_REDIRECT_URI: https://${FILES_HOST}/apps/user_oidc/code
+      JELLYFIN_URL: https://${MEDIA_HOST}
+      JELLYFIN_REDIRECT_URI: https://${MEDIA_HOST}/sso/OID/redirect/authentik
+    volumes:
+      - /srv/server/data/authentik/media:/data
+      - ./infrastructure/authentik/blueprints:/blueprints/custom:ro
+    shm_size: 512mb
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+    networks: [edge, private]
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+  authentik-worker:
+    container_name: server-authentik-worker
+    profiles: ["core"]
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG:-2026.8.3}
+    restart: unless-stopped
+    command: worker
+    env_file: .env
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?secret key required}
+    volumes:
+      - /srv/server/data/authentik/media:/data
+      - ./infrastructure/authentik/blueprints:/blueprints/custom:ro
+    shm_size: 512mb
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+    networks: [private]
+
+  redis:
+    container_name: server-redis
+    profiles: ["core"]
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?redis password required}", "--appendonly", "no"]
+    networks: [private]
+    mem_limit: 256m
+
+  dashboard:
+    container_name: server-dashboard
+    profiles: ["core"]
+    build: ./dashboard
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /var/lib/dashboard
+      REDIS_URL: redis://:${REDIS_PASSWORD}@server-redis:6379/0
+      EXECUTOR_URL: http://server-executor:8090
+      AUTHENTIK_INTERNAL_URL: http://server-authentik:9000
+      AUTHENTIK_BROWSER_URL: https://${AUTH_HOST}
+      PROMETHEUS_URL: http://server-prometheus:9090
+      VLLM_URL: http://server-vllm:8000
+      VLLM_MANAGER_URL: http://server-vllm-manager:8000
+      LLMLINGUA_URL: http://server-llmlingua:8000
+      COOLIFY_API_URL: http://server-coolify:8080
+      WEBSITES_FILE: /config/websites.json
+    volumes:
+      - /srv/server/data/dashboard:/var/lib/dashboard
+      - ./config/websites.json:/config/websites.json:ro
+    depends_on:
+      - redis
+    networks: [edge, private]
+    mem_limit: 512m
+
+  executor:
+    container_name: server-executor
+    profiles: ["core"]
+    build: ./services/executor
+    restart: unless-stopped
+    environment:
+      EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:?executor token required}
+      MINECRAFT_RCON_PASSWORD: ${MINECRAFT_RCON_PASSWORD}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/bulk/backups:/backups
+    networks: [private]
+
+  prometheus:
+    container_name: server-prometheus
+    profiles: ["core"]
+    image: prom/prometheus:v3.4.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infrastructure/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - /srv/server/data/prometheus:/prometheus
+    networks: [private]
+    mem_limit: 1g
+
+  grafana:
+    container_name: server-grafana
+    profiles: ["core"]
+    image: grafana/grafana:11.6.0
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?grafana password required}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_ROOT_URL: https://${GRAFANA_HOST}
+      GF_AUTH_GENERIC_OAUTH_ENABLED: "true"
+      GF_AUTH_GENERIC_OAUTH_NAME: Authentik
+      GF_AUTH_GENERIC_OAUTH_CLIENT_ID: grafana
+      GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: ${GRAFANA_OIDC_SECRET}
+      GF_AUTH_GENERIC_OAUTH_SCOPES: openid email profile groups
+      GF_AUTH_GENERIC_OAUTH_AUTH_URL: https://${AUTH_HOST}/application/o/authorize/
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: http://server-authentik:9000/application/o/token/
+      GF_AUTH_GENERIC_OAUTH_API_URL: http://server-authentik:9000/application/o/userinfo/
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: contains(groups[*], 'administrators') && 'Admin' || ''
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_STRICT: "true"
+      GF_AUTH_GENERIC_OAUTH_ALLOW_ASSIGN_GRAFANA_ADMIN: "true"
+    volumes:
+      - /srv/server/data/grafana:/var/lib/grafana
+      - ./infrastructure/monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./runtime/grafana/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
+    networks: [edge, private]
+    mem_limit: 512m
+
+  loki:
+    container_name: server-loki
+    profiles: ["core"]
+    image: grafana/loki:3.4.2
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki.yml
+    volumes:
+      - ./infrastructure/monitoring/loki.yml:/etc/loki/loki.yml:ro
+      - /srv/server/data/loki:/loki
+    networks: [private]
+    mem_limit: 1g
+
+  promtail:
+    container_name: server-promtail
+    profiles: ["core"]
+    image: grafana/promtail:3.4.2
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail.yml
+    volumes:
+      - ./infrastructure/monitoring/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [private]
+    mem_limit: 256m
+
+  node-exporter:
+    container_name: server-node-exporter
+    profiles: ["core"]
+    image: prom/node-exporter:v1.9.1
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+    networks: [private]
+    mem_limit: 128m
+
+  cadvisor:
+    container_name: server-cadvisor
+    profiles: ["core"]
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    restart: unless-stopped
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    networks: [private]
+    mem_limit: 256m
+
+  ntfy:
+    container_name: server-ntfy
+    profiles: ["core"]
+    image: binwiederhier/ntfy:v2.14.0
+    restart: unless-stopped
+    command: serve
+    volumes:
+      - ./runtime/ntfy/server.yml:/etc/ntfy/server.yml:ro
+      - /srv/server/data/ntfy:/var/lib/ntfy
+    networks: [edge, private]
+    mem_limit: 128m
+
+  dns-updater:
+    container_name: server-dns-updater
+    profiles: ["core"]
+    image: python:3.12-slim
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./scripts/maintenance/update-dns.py:/update-dns.py:ro
+    command: ["python", "-u", "/update-dns.py"]
+    networks: [edge]
+    mem_limit: 64m
+
+  jellyfin:
+    container_name: server-jellyfin
+    profiles: ["media"]
+    image: jellyfin/jellyfin:10.10.7
+    restart: unless-stopped
+    environment:
+      JELLYFIN_PublishedServerUrl: https://${MEDIA_HOST}
+    volumes:
+      - /srv/server/data/jellyfin/config:/config
+      - /srv/server/data/jellyfin/cache:/cache
+      - /srv/bulk/media:/media
+    networks: [edge]
+    mem_limit: 4g
+
+  forgejo-db:
+    container_name: server-forgejo-db
+    profiles: ["git"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: forgejo
+      POSTGRES_USER: forgejo
+      POSTGRES_PASSWORD: ${FORGEJO_DB_PASSWORD:?forgejo db password required}
+    volumes:
+      - /srv/server/data/forgejo/postgres:/var/lib/postgresql/data
+    networks: [private]
+    mem_limit: 512m
+
+  forgejo:
+    container_name: server-forgejo
+    profiles: ["git"]
+    image: codeberg.org/forgejo/forgejo:11
+    restart: unless-stopped
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST: server-forgejo-db:5432
+      FORGEJO__database__NAME: forgejo
+      FORGEJO__database__USER: forgejo
+      FORGEJO__database__PASSWD: ${FORGEJO_DB_PASSWORD}
+      FORGEJO__server__DOMAIN: ${GIT_HOST}
+      FORGEJO__server__ROOT_URL: https://${GIT_HOST}/
+      FORGEJO__server__SSH_PORT: "22"
+      FORGEJO__service__DISABLE_REGISTRATION: "true"
+      FORGEJO__oauth2_client__ENABLE_AUTO_REGISTRATION: "true"
+    volumes:
+      - /srv/server/data/forgejo/data:/data
+    depends_on:
+      - forgejo-db
+    networks: [edge, private]
+    mem_limit: 1g
+
+  nextcloud-db:
+    container_name: server-nextcloud-db
+    profiles: ["collab"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${NEXTCLOUD_DB_PASSWORD:?nextcloud db password required}
+    volumes:
+      - /srv/server/data/nextcloud/postgres:/var/lib/postgresql/data
+    networks: [private]
+    mem_limit: 512m
+
+  nextcloud:
+    container_name: server-nextcloud
+    profiles: ["collab"]
+    image: nextcloud:31-apache
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: server-nextcloud-db
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+      NEXTCLOUD_ADMIN_USER: ncadmin
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:?nextcloud admin password required}
+      NEXTCLOUD_TRUSTED_DOMAINS: ${FILES_HOST}
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: ${FILES_HOST}
+      NEXTCLOUD_DATA_DIR: /var/www/html/data
+    volumes:
+      - /srv/server/data/nextcloud/html:/var/www/html
+      - /srv/bulk/nextcloud:/var/www/html/data
+    depends_on:
+      - nextcloud-db
+    networks: [edge, private]
+    mem_limit: 2g
+
+  collabora:
+    container_name: server-collabora
+    profiles: ["collab"]
+    image: ${COLLABORA_IMAGE:-collabora/code:latest}
+    restart: unless-stopped
+    environment:
+      aliasgroup1: https://${FILES_HOST}:443
+      server_name: ${OFFICE_HOST}
+      extra_params: --o:ssl.enable=false --o:ssl.termination=true
+      DONT_GEN_SSL_CERT: "1"
+    cap_add:
+      - MKNOD
+      - SYS_CHROOT
+    networks: [edge]
+    mem_limit: 2g
+
+  minecraft:
+    container_name: server-minecraft
+    profiles: ["games"]
+    image: itzg/minecraft-server:java21
+    restart: unless-stopped
+    environment:
+      EULA: ${MINECRAFT_EULA:-FALSE}
+      TYPE: PAPER
+      MEMORY: ${MINECRAFT_MEMORY:-4G}
+      ENABLE_RCON: "true"
+      RCON_PASSWORD: ${MINECRAFT_RCON_PASSWORD:-}
+    ports:
+      - "25565:25565"
+    volumes:
+      - /srv/bulk/minecraft:/data
+    networks: [private]
+    mem_limit: 6g
+
+  vllm:
+    container_name: server-vllm
+    profiles: ["ai"]
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    ipc: host
+    labels:
+      ai-model: "true"
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    command: ["--model", "${VLLM_MODEL}", "--host", "0.0.0.0", "--port", "8000", "--gpu-memory-utilization", "${VLLM_GPU_UTIL:-0.9}"]
+    volumes:
+      - /srv/bulk/models:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks: [private]
+
+  vllm-manager:
+    container_name: server-vllm-manager
+    profiles: ["ai-manager"]
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    ipc: host
+    labels:
+      ai-model: "true"
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    command: ["--model", "${VLLM_MANAGER_MODEL:-}", "--host", "0.0.0.0", "--port", "8000", "--gpu-memory-utilization", "0.25"]
+    volumes:
+      - /srv/bulk/models:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks: [private]
+
+  llmlingua:
+    container_name: server-llmlingua
+    profiles: ["ai"]
+    build: ./services/llmlingua
+    restart: unless-stopped
+    labels:
+      ai-model: "true"
+    environment:
+      HF_HOME: /models
+    volumes:
+      - /srv/bulk/models:/models
+    networks: [private]
+    mem_limit: 8g
+
+  gpu-exporter:
+    container_name: server-gpu-exporter
+    profiles: ["ai"]
+    image: ${GPU_EXPORTER_IMAGE:-nvidia/dcgm-exporter:latest}
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks: [private]
+
+  lavalink:
+    container_name: server-lavalink
+    profiles: ["discord"]
+    image: ghcr.io/lavalink-devs/lavalink:4
+    restart: unless-stopped
+    environment:
+      _JAVA_OPTIONS: "-Xmx512M"
+    volumes:
+      - ./runtime/lavalink/application.yml:/opt/Lavalink/application.yml:ro
+    networks: [private]
+    mem_limit: 768m
+
+  discord-bot:
+    container_name: server-discord-bot
+    profiles: ["discord"]
+    build: ./services/discord
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HEALTH_URL: http://server-dashboard:8000/health
+      LAVALINK_URL: http://server-lavalink:2333
+      LAVALINK_HOST: server-lavalink
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD}
+    networks: [private]
+    mem_limit: 256m
+
+  coolify-db:
+    container_name: server-coolify-db
+    profiles: ["deploy"]
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: coolify
+      POSTGRES_USER: coolify
+      POSTGRES_PASSWORD: ${COOLIFY_DB_PASSWORD:?coolify db password required}
+    volumes:
+      - coolify-db:/var/lib/postgresql/data
+    networks: [private]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coolify -d coolify"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  coolify-redis:
+    container_name: server-coolify-redis
+    profiles: ["deploy"]
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${COOLIFY_REDIS_PASSWORD:?coolify redis password required}"]
+    environment:
+      REDISCLI_AUTH: ${COOLIFY_REDIS_PASSWORD}
+    volumes:
+      - coolify-redis:/data
+    networks: [private]
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  coolify-realtime:
+    container_name: server-coolify-realtime
+    profiles: ["deploy"]
+    image: coollabsio/coolify-realtime:1.0.19
+    restart: unless-stopped
+    environment:
+      APP_NAME: Coolify
+      SOKETI_DEFAULT_APP_ID: ${COOLIFY_PUSHER_APP_ID}
+      SOKETI_DEFAULT_APP_KEY: ${COOLIFY_PUSHER_APP_KEY}
+      SOKETI_DEFAULT_APP_SECRET: ${COOLIFY_PUSHER_APP_SECRET}
+      SOKETI_HOST: 0.0.0.0
+    volumes:
+      - /data/coolify/ssh:/var/www/html/storage/app/ssh
+    networks: [private]
+    mem_limit: 256m
+
+  coolify:
+    container_name: server-coolify
+    profiles: ["deploy"]
+    image: ${COOLIFY_IMAGE:-coollabsio/coolify:latest}
+    restart: unless-stopped
+    env_file:
+      - ./runtime/coolify.env
+    volumes:
+      - ./runtime/coolify.env:/var/www/html/.env:ro
+      - /data/coolify/ssh:/var/www/html/storage/app/ssh
+      - /data/coolify/applications:/var/www/html/storage/app/applications
+      - /data/coolify/databases:/var/www/html/storage/app/databases
+      - /data/coolify/services:/var/www/html/storage/app/services
+      - /data/coolify/backups:/var/www/html/storage/app/backups
+      - /data/coolify/images:/var/www/html/storage/app/images
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      coolify-db:
+        condition: service_healthy
+      coolify-redis:
+        condition: service_healthy
+      coolify-realtime:
+        condition: service_started
+    networks: [edge, private]
+    mem_limit: 1g

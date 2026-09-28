@@ -1,0 +1,6 @@
+base-url: https://notify.example.com
+behind-proxy: true
+auth-file: /var/lib/ntfy/user.db
+auth-default-access: deny-all
+attachment-cache-dir: /var/lib/ntfy/attachments
+cache-file: /var/lib/ntfy/cache.db

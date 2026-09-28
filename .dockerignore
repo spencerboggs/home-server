@@ -1,0 +1,5 @@
+.git
+runtime
+**/node_modules
+**/dist
+**/.env

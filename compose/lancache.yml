@@ -1,0 +1,18 @@
+# Optional. Bind a second address so this does not take Caddy's port 80.
+# sudo ./scripts/up.sh cache
+# requires LANCACHE_BIND_IP in .env, for example 192.168.50.11
+
+services:
+  lancache:
+    container_name: server-lancache
+    image: lancachenet/monolithic:latest
+    restart: unless-stopped
+    environment:
+      CACHE_DISK_SIZE: ${LANCACHE_DISK_SIZE:-200g}
+      CACHE_MAX_AGE: ${LANCACHE_MAX_AGE:-30d}
+      UPSTREAM_DNS: 1.1.1.1
+    ports:
+      - "${LANCACHE_BIND_IP:?set LANCACHE_BIND_IP to a secondary address}:80:80"
+    volumes:
+      - /srv/bulk/lancache:/data/cache
+    mem_limit: 1g
